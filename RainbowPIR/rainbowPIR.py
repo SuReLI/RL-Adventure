@@ -1,22 +1,18 @@
 import math, random
-
 import sys
 import gym
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.autograd as autograd 
 import torch.nn.functional as F
 from collections import deque
-from replay_prio import Prioritized
-
+from prioritized_replay import Prioritized
 from IPython.display import clear_output
 import matplotlib.pyplot as plt
 
-from common.wrappers import make_atari, wrap_deepmind, wrap_pytorch
-
+#User chooses if he wants to use CUDA
 if sys.argv[1]=='CUDA':
     USE_CUDA = torch.cuda.is_available()
 else :
@@ -24,64 +20,12 @@ else :
 
 Variable = lambda *args, **kwargs: autograd.Variable(*args, **kwargs).cuda() if USE_CUDA else autograd.Variable(*args, **kwargs)
 
-
-
-class ReplayBuffer(object):
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-    
-    def push(self, state, action, rewards, nextstate, done):
-        #states      = np.expand_dims(states, 0)
-#        print("\n\n PUSH ",rewards,"\n\n")
-        self.buffer.append((state, action, rewards, nextstate, done))
-#        print("\n\n BUFFER",self.buffer)
-    
-    def sample(self,batch_size):
-        idxes = [random.randint(0, len(self) - 1) for _ in range(batch_size)]
-        states, actions, rewards, nextstates, dones = [], [], [], [], []
-        for i in idxes:
-            data = self.buffer[i]
-#            for j in range(len(data)-1):
-#                print(data[j])
-#                print('\n')
-            state, action, reward, nextstate, done = data
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            nextstates.append(nextstate)
-            dones.append(done)
-#            print(np.array(rewards, copy=False))
-#            print("\n Data ")
-        return np.array(states, copy=False), np.array(actions, copy=False), np.array(rewards, copy=False), np.array(nextstates, copy=False), np.array(dones, copy=False)
-
-
-#    def sample(self, batch_size):
-#        action, rewards, states, done = zip(*random.sample(self._buffer, batch_size))
-#        return np.array(action), np.array(rewards), np.array(states), np.array(done)
-    
-    def __len__(self):
-        return len(self.buffer)
-        
-        
-        
-env_id = "CartPole-v0"
-#env_id = "LunarLander-v2"
-#env_id = "Acrobot-v1"
+#Select environment
+list_env = ["CartPole-v0", "LunarLander-v2", "Acrobot-v1"]
+env_id = list_env[1]
 env = gym.make(env_id)
 
-epsilon_start = 1.0
-epsilon_final = 0.05
-epsilon_decay = 500
-
-epsilon_by_frame = lambda frame_idx: epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame_idx / epsilon_decay)
-
-## Epsilon-greedy :
-epsilon = epsilon_start
-epsilon_decay_length = 100000
-epsilon_decay_exp = 0.97
-epsilon_linear_step = (epsilon_start-epsilon_final)/epsilon_decay_length
-
-
+#Noisy Networks
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=0.5):
         super(NoisyLinear, self).__init__()
@@ -132,10 +76,10 @@ class NoisyLinear(nn.Module):
         x = x.sign().mul(x.abs().sqrt())
         return x
         
-
-
-
+        
+#Definition of the neural network
 class DQN(nn.Module):
+    
     def __init__(self, num_inputs, num_actions):
         super(DQN, self).__init__()
         
@@ -147,7 +91,7 @@ class DQN(nn.Module):
         self.advantage = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(128, num_actions) #Noisy --> NO
+            nn.Linear(128, num_actions)
         )
         
         self.value = nn.Sequential(
@@ -157,100 +101,97 @@ class DQN(nn.Module):
         )
         
         self.noisy1 = NoisyLinear(128,128)
-    #    self.noisy2 = NoisyLinear(128,env.action_space.n)
-   #     self.noisy3 = NoisyLinear(128,1)
-        
+        #TODO add some other noisy layers at the end of value & advantage ?
+
+    #Passing a state through the network
     def forward(self, x):
         x = self.feature(x)
         x = self.noisy1(x)
         advantage = self.advantage(x)
-  #      advantage = self.noisy2(advantage)
         value = self.value(x)
- #       value = self.noisy3(value)
+        #Dueling DQN output
         return value + advantage - advantage.mean()
     
-    def act(self, state, epsilon):
-        #if random.random() > epsilon:
-        if 1==1:
-            with torch.no_grad():
-                state   = Variable(torch.FloatTensor(state).unsqueeze(0))
-                q_value = self.forward(state)
-                action  = q_value.max(1)[1].cpu().numpy()[0]
-        else:
-            action = random.randrange(env.action_space.n)
+    #Choose best action
+    def act(self, state):
+        with torch.no_grad():
+            state   = Variable(torch.FloatTensor(state).unsqueeze(0))
+            q_value = self.forward(state)
+            action  = q_value.max(1)[1].cpu().numpy()[0]
         return action
-        
+
     def reset_noise(self):
         self.noisy1.reset_noise()
-#        self.noisy2.reset_noise()
-#        self.noisy3.reset_noise()
         
-        
-        
+#Initialization of the 2 networks (Double DQN)
 current_model = DQN(env.observation_space.shape[0], env.action_space.n)
 target_model = DQN(env.observation_space.shape[0], env.action_space.n)
-
 if USE_CUDA:
     current_model = current_model.cuda()
     target_model = target_model.cuda()
-
+    
 def update_target(current_model,target_model):
     target_model.load_state_dict(current_model.state_dict())
 
+#Initialization of target network : identical to current network
 update_target(current_model,target_model)
 
-
+#Definition of the optimizer (for the loss minimization)
 optimizer = optim.Adam(current_model.parameters())
-#, lr = 0.00025
+
+#Initialization of Prioritized Experience Replay Buffer
 replay_buffer = Prioritized(100000,0.5)
-#replay_buffer = ReplayBuffer(100000)
 
-def compute_td_loss(batch_size, beta):
+
+#Loss computation and network optimization
+def compute_loss(batch_size, beta):
     
-    state, action, rewards, nextstate, done, weights, idxes = replay_buffer.sample(batch_size, beta)
-    #state, action, rewards, nextstate, done = replay_buffer.sample(batch_size)
-
-    state      = Variable(torch.FloatTensor(np.float32(state)))
+    #sample [batch_size] transitions
+    nprev_state, action, rewards, nextstate, done, weights, idxes = replay_buffer.sample(batch_size, beta)
+    nprev_state      = Variable(torch.FloatTensor(np.float32(nprev_state)))
     action     = Variable(torch.LongTensor(action))
     rewards     = Variable(torch.FloatTensor(np.float32(rewards)))
-    rewards = torch.transpose(rewards,0,1)
+    rewards = torch.transpose(rewards,0,1) #size [n_multistep,batch_size]
     nextstate = Variable(torch.FloatTensor(np.float32(nextstate)))
     done       = Variable(torch.FloatTensor(done))
-    done = torch.transpose(done,0,1)
+    done = torch.transpose(done,0,1) #size [n_multistep,batch_size]
     weights = Variable(torch.FloatTensor(weights))
 
     with torch.no_grad():
-        donenew = abs(done - 1) 
-#        donenew = done  
-    
-#    reward_n = 0
-    reward_n = Variable(torch.FloatTensor([0 for i in range(done.size(1))]))
-#    isdone = [False for j in range(done.size(1))]
-    for i in range(n):
-#        for j in range(done.size(1)):
-#            if done[i][j]==1:
-#                isdone[j] = True
-#            if not isdone[j]:
-#                reward_n[j] += rewards[i][j]*gamma**(n-i-1)
-        if i>0:
-            donenew[i] = donenew[i] * donenew[i-1] 
-        reward_n += donenew[i] * rewards[i]*gamma**(n-i-1)
+        donenew = abs(done - 1) #invert 0s and 1s in done 
 
-    q_values      = current_model(state)
+    #Initialization of the multistep reward
+    reward_n = Variable(torch.FloatTensor([0 for i in range(batch_size)]))
+
+    #Computation of the multistep reward
+    for i in range(n_multistep):
+        if i>0:
+            donenew[i] = donenew[i] * donenew[i-1] #donenew[i][j]=0 if one of the previous actions led to done episode   
+        #reward_n is incremented only if the episode is not done 
+        #(=> we don't take into account different episodes in the same multistep reward)
+        #TODO check if really useful
+        reward_n += donenew[i] * rewards[i]*gamma**(n_multistep-i-1)
+
+
+    q_values      = current_model(nprev_state)
     with torch.no_grad():
         next_q_values = current_model(nextstate)
         next_q_state_values = target_model(nextstate)
-
+        
     q_value          = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+    #next q value = over the best action only
     next_q_value     = next_q_state_values.gather(1,torch.max(next_q_values,1)[1].unsqueeze(1)).squeeze(1)
 
-    expected_q_value = reward_n + (gamma**n) * next_q_value * (1 - done[0])
+    expected_q_value = reward_n + (gamma**n_multistep) * next_q_value * (1 - done[0])
 
+    #Loss computation
     loss = (q_value - Variable(expected_q_value.data)).pow(2)
     loss = loss * weights
+    #calculation of priorities prioritized replay 
     prios = loss**0.5 + 1e-5
     loss = loss.mean()
         
+    #Optimization
     optimizer.zero_grad()
     loss.backward()
     replay_buffer.update_priorities(idxes,prios.data.cpu().numpy())
@@ -271,7 +212,7 @@ def plot(frame_idx, rewards, losses):
     plt.subplot(132)
     plt.title('loss')
     plt.plot(losses)
-    plt.savefig('rainbow_empty9_05cart_OK.png')
+    plt.savefig('rainbowPIR.png')
     plt.close()
     
     
@@ -279,10 +220,9 @@ num_frames = 1000000
 num_episodes = 2000
 batch_size = 64
 gamma      = 0.99
-n = 3 #Multistep
+n_multistep = 3
 
-#replayInitial = 10000
-
+#Prioritized Replay parameter : linear increase for beta_frames frames, then constant
 beta_start = 0.4
 beta_frames = 1000 
 beta_by_frame = lambda frame_idx: min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
@@ -293,53 +233,44 @@ episode_reward = 0
 frame_idx = 0
 render = False
 state = env.reset()
-states = [state for i in range(n+1)] #Multistep
-#states = []
-#rewards = torch.Tensor([0 for i in range(n)]) #Multistep
-rewards = [0 for i in range(n)]
-dones = [0 for i in range(n)]
+states = [state for i in range(n_multistep+1)]
+rewards = [0 for i in range(n_multistep)]
+dones = [0 for i in range(n_multistep)]
 
-#for frame_idx in range(1, num_frames + 1):
 
 while len(all_rewards) <= num_episodes :
 
+    #Frame by frame update : prioritized replay parameter
     beta = beta_by_frame(frame_idx)
-    epsilon = epsilon_by_frame(frame_idx)
     
+    #Take the same action for 4 frames
     if frame_idx % 4 == 0:
-        action = current_model.act(states[0],epsilon)
+        action = current_model.act(states[0])
     
-#    action = current_model.act(states[0], epsilon)
     next_state, reward, done, _ = env.step(action)
     
-    #Rotate (scalars)
+    #Multistep buffers rotation
     states = states[-1:] + states[:-1]
     states[0] = next_state
-    
-    for i in range(n-1,0,-1):
-        rewards[i] = rewards[i-1]
+    rewards = rewards[-1:] + rewards[:-1]
     rewards[0] = reward
-    for i in range(n-1,0,-1):
-        dones[i] = dones[i-1]
+    dones = dones[-1:] + dones[:-1]
     dones[0] = done
+
+    #Incrementation of prioritized replay buffer
+    replay_buffer.push(states[n_multistep], action, rewards[:], states[0], dones[:])
     
-    replay_buffer.push(states[n], action, rewards[:], states[0], dones[:])
-    
-#    state = next_state
     episode_reward += reward
 
-#    if frame_idx < epsilon_decay_length:
-#        epsilon -= epsilon_linear_step
-#    elif done:    
-#        epsilon *= epsilon_decay_exp
-
+    #Reset when finished episode
     if done:
         states[0] = env.reset()
         all_rewards.append(episode_reward)
         episode_reward = 0
         
+    #Loss computation & network optimization
     if len(replay_buffer) > batch_size:
-        loss = compute_td_loss(batch_size, beta)
+        loss = compute_loss(batch_size, beta)
         losses.append(loss.data)
         
     if frame_idx % 200 == 0:
@@ -348,6 +279,7 @@ while len(all_rewards) <= num_episodes :
     if frame_idx % 100 == 0:
         update_target(current_model, target_model)
     
+    #Rendering tool
     if sys.argv[2] == 'render':
         if frame_idx % 5000 == 0 :
             render = True    
@@ -358,8 +290,8 @@ while len(all_rewards) <= num_episodes :
             else:
                 env.render()
         
-    
-    frame_idx += 1
-
     if frame_idx % 1000 == 0:
         print("iteration",frame_idx)
+
+    #Incrementation of the number of frames
+    frame_idx += 1
